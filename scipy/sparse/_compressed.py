@@ -17,7 +17,8 @@ from ._sparsetools import (get_csr_submatrix, csr_sample_offsets, csr_todense,
 from ._index import IndexMixin
 from ._sputils import (upcast, upcast_char, to_native, isdense, isshape,
                        getdtype, isscalarlike, isintlike, downcast_intp_index,
-                       get_sum_dtype, check_shape, is_pydata_spmatrix)
+                       get_sum_dtype, check_shape, is_pydata_spmatrix,
+                       broadcast_shapes)
 
 
 class _cs_matrix(_data_matrix, _minmax_mixin, IndexMixin):
@@ -446,11 +447,11 @@ class _cs_matrix(_data_matrix, _minmax_mixin, IndexMixin):
             if other.dtype == np.object_:
                 # 'other' not convertible to ndarray.
                 return NotImplemented
-            bshape = np.broadcast_shapes(self.shape, other.shape)
+            bshape = broadcast_shapes(self.shape, other.shape)
             return self._mul_scalar(other.flat[0]).reshape(bshape)
         # Fast case for trivial sparse matrix.
         if self.shape in ((1,), (1, 1)):
-            bshape = np.broadcast_shapes(self.shape, other.shape)
+            bshape = broadcast_shapes(self.shape, other.shape)
             return np.multiply(self.data.sum(), other).reshape(bshape)
 
         ret = self.tocoo()
@@ -550,6 +551,7 @@ class _cs_matrix(_data_matrix, _minmax_mixin, IndexMixin):
             new_shape += (M,)
         if o_ndim == 2:
             new_shape += (N,)
+        faux_shape = (M if self.ndim == 2 else 1, N if o_ndim == 2 else 1)
 
         major_dim = self._swap((M, N))[0]
         other = self.__class__(other)  # convert to this format
@@ -587,7 +589,12 @@ class _cs_matrix(_data_matrix, _minmax_mixin, IndexMixin):
 
         if new_shape == ():
             return np.array(data[0])
-        return self.__class__((data, indices, indptr), shape=new_shape)
+        res = self.__class__((data, indices, indptr), shape=faux_shape)
+        if faux_shape != new_shape:
+            if res.format != 'csr':
+                res = res.tocsr()
+            res = res.reshape(new_shape)
+        return res
 
     def diagonal(self, k=0):
         rows, cols = self.shape
@@ -964,17 +971,17 @@ class _cs_matrix(_data_matrix, _minmax_mixin, IndexMixin):
             self.data[offsets] = x
             return
 
-        mask = (offsets <= -1)
+        mask = (offsets >= 0)
         # Boundary between csc and convert to coo
         # The value 0.001 is justified in gh-19962#issuecomment-1920499678
-        if mask.sum() < self.nnz * 0.001:
+        if self.nnz - mask.sum() < self.nnz * 0.001:
+            # replace existing entries
+            self.data[offsets[mask]] = x[mask]
             # create new entries
+            mask = ~mask
             i = i[mask]
             j = j[mask]
             self._insert_many(i, j, x[mask])
-            # replace existing entries
-            mask = ~mask
-            self.data[offsets[mask]] = x[mask]
         else:
             # convert to coo for _set_diag
             coo = self.tocoo()
@@ -988,12 +995,10 @@ class _cs_matrix(_data_matrix, _minmax_mixin, IndexMixin):
         def check_bounds(indices, bound):
             idx = indices.max()
             if idx >= bound:
-                raise IndexError('index (%d) out of range (>= %d)' %
-                                 (idx, bound))
+                raise IndexError('index ({idx}) out of range (>= {bound})')
             idx = indices.min()
             if idx < -bound:
-                raise IndexError('index (%d) out of range (< -%d)' %
-                                 (idx, bound))
+                raise IndexError('index ({idx}) out of range (>= {bound})')
 
         i = np.atleast_1d(np.asarray(i, dtype=self.indices.dtype)).ravel()
         j = np.atleast_1d(np.asarray(j, dtype=self.indices.dtype)).ravel()
@@ -1402,6 +1407,56 @@ class _cs_matrix(_data_matrix, _minmax_mixin, IndexMixin):
             # integers types go with nan <-> 0
             out = r
             return out
+
+    def _broadcast_to(self, shape, copy=False):
+        if self.shape == shape:
+            return self.copy() if copy else self
+        
+        shape = check_shape(shape, allow_nd=(self._allow_nd))
+
+        if broadcast_shapes(self.shape, shape) != shape:
+            raise ValueError("cannot be broadcast")
+        
+        if len(self.shape) == 1 and len(shape) == 1:
+            self.sum_duplicates()
+            if self.nnz == 0: # array has no non zero elements
+                return self.__class__(shape, dtype=self.dtype, copy=False)
+            
+            N = shape[0]
+            data = np.full(N, self.data[0])
+            indices = np.arange(0,N)
+            indptr = np.array([0, N])
+            return self._csr_container((data, indices, indptr), shape=shape, copy=False)
+
+        # treat 1D as a 2D row
+        old_shape = self._shape_as_2d
+            
+        if len(shape) != 2:
+            ndim = len(shape)
+            raise ValueError(f'CSR/CSC broadcast_to cannot have shape >2D. Got {ndim}D')
+        
+        if self.nnz == 0: # array has no non zero elements
+            return self.__class__(shape, dtype=self.dtype, copy=False)
+        
+        self.sum_duplicates()
+        M, N = self._swap(shape)
+        oM, oN = self._swap(old_shape)
+        if all(s == 1 for s in old_shape):
+            # Broadcast a single element to the entire shape
+            data = np.full(M * N, self.data[0])
+            indices = np.tile(np.arange(N), M)
+            indptr = np.arange(0, len(data) + 1, N)
+        elif oM == 1 and oN == N:
+            # Broadcast row-wise (columns for CSC)
+            data = np.tile(self.data, M)
+            indices = np.tile(self.indices, M)
+            indptr = np.arange(0, len(data) + 1, len(self.data))
+        elif oN == 1 and oM == M:
+            # Broadcast column-wise (rows for CSC)
+            data = np.repeat(self.data, N)
+            indices = np.tile(np.arange(N), len(self.data))
+            indptr = self.indptr * N
+        return self.__class__((data, indices, indptr), shape=shape, copy=False)
 
 
 def _make_diagonal_csr(data, is_array=False):
